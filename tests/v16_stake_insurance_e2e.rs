@@ -646,3 +646,347 @@ fn propose_zero_cancels_pending() {
         TransactionError::InstructionError(_, InstructionError::Custom(23))
     ));
 }
+
+// ── No-lockout: rotate the insurance authority off the PDA + re-bind from a
+//    "redeployed" stake program (new program id => new vault_auth PDA) ──────────
+
+struct PoolCtx {
+    stake_id: Pubkey,
+    pool_pda: Pubkey,
+    vault_auth: Pubkey,
+    stake_vault: Pubkey,
+}
+
+/// Create a Live v16 market (preallocate + InitMarket). Returns (market, mint, wrapper_vault).
+fn build_live_market(
+    svm: &mut LiteSVM,
+    wrapper_id: Pubkey,
+    token_program: Pubkey,
+    admin: &Keypair,
+    payer: &Keypair,
+) -> (Pubkey, Pubkey, Pubkey) {
+    let market = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    svm.set_account(
+        mint,
+        Account {
+            lamports: 1_000_000_000,
+            data: mint_data(),
+            owner: token_program,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let wrapper_vault_auth =
+        Pubkey::find_program_address(&[b"vault", market.as_ref()], &wrapper_id).0;
+    let wrapper_vault = Pubkey::new_unique();
+    set_token_account(svm, wrapper_vault, &mint, &wrapper_vault_auth, 0);
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; MARKET_LEN_CAP1],
+            owner: wrapper_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let init = Instruction {
+        program_id: wrapper_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(mint, false),
+        ],
+        data: encode_init_market_default(),
+    };
+    send(svm, payer, &[admin], init).expect("InitMarket");
+    (market, mint, wrapper_vault)
+}
+
+/// Craft a funded insurance-LP stake pool for `market` under `stake_id` (the .so
+/// must already be loaded at that id). vault_auth derives under `stake_id`.
+fn add_stake_pool(
+    svm: &mut LiteSVM,
+    stake_id: Pubkey,
+    wrapper_id: Pubkey,
+    market: Pubkey,
+    mint: Pubkey,
+    admin: &Pubkey,
+    amount: u64,
+) -> PoolCtx {
+    let (pool_pda, _) = derive_pool_pda(&stake_id, &market);
+    let (vault_auth, bump) = derive_vault_authority(&stake_id, &pool_pda);
+    let stake_vault = Pubkey::new_unique();
+    set_token_account(svm, stake_vault, &mint, &vault_auth, amount);
+    let mut pool = StakePool::zeroed();
+    pool.is_initialized = 1;
+    pool.bump = 255;
+    pool.vault_authority_bump = bump;
+    pool.slab = market.to_bytes();
+    pool.admin = admin.to_bytes();
+    pool.collateral_mint = mint.to_bytes();
+    pool.lp_mint = Pubkey::new_unique().to_bytes();
+    pool.vault = stake_vault.to_bytes();
+    pool.total_deposited = amount;
+    pool.percolator_program = wrapper_id.to_bytes();
+    pool.pool_mode = 0;
+    pool.set_discriminator();
+    let mut bytes = vec![0u8; STAKE_POOL_SIZE];
+    bytes.copy_from_slice(bytemuck::bytes_of(&pool));
+    svm.set_account(
+        pool_pda,
+        Account {
+            lamports: 1_000_000_000,
+            data: bytes,
+            owner: stake_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    PoolCtx {
+        stake_id,
+        pool_pda,
+        vault_auth,
+        stake_vault,
+    }
+}
+
+fn bind_ix(ctx: &PoolCtx, wrapper_id: Pubkey, market: Pubkey, admin: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: ctx.stake_id,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new_readonly(ctx.pool_pda, false),
+            AccountMeta::new_readonly(ctx.vault_auth, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(wrapper_id, false),
+        ],
+        data: vec![19u8],
+    }
+}
+
+fn rotate_ix(
+    ctx: &PoolCtx,
+    wrapper_id: Pubkey,
+    market: Pubkey,
+    admin: &Pubkey,
+    new_target: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: ctx.stake_id,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new_readonly(ctx.pool_pda, false),
+            AccountMeta::new_readonly(ctx.vault_auth, false),
+            AccountMeta::new_readonly(*new_target, true), // new authority co-signs
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(wrapper_id, false),
+        ],
+        data: vec![20u8],
+    }
+}
+
+fn flush_ix_ctx(
+    ctx: &PoolCtx,
+    wrapper_id: Pubkey,
+    token_program: Pubkey,
+    market: Pubkey,
+    wrapper_vault: Pubkey,
+    admin: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    let mut data = vec![3u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: ctx.stake_id,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new(ctx.pool_pda, false),
+            AccountMeta::new(ctx.stake_vault, false),
+            AccountMeta::new_readonly(ctx.vault_auth, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(wrapper_vault, false),
+            AccountMeta::new_readonly(wrapper_id, false),
+            AccountMeta::new_readonly(token_program, false),
+        ],
+        data,
+    }
+}
+
+/// Locate the offset of a 32-byte pubkey within account data (used to find the
+/// `insurance_authority` field by searching for the unique bound PDA bytes).
+fn find_pubkey_offset(data: &[u8], needle: &[u8; 32]) -> Option<usize> {
+    data.windows(32).position(|w| w == needle)
+}
+
+fn read_at(svm: &LiteSVM, market: &Pubkey, off: usize) -> [u8; 32] {
+    let d = svm.get_account(market).unwrap().data;
+    d[off..off + 32].try_into().unwrap()
+}
+
+/// THE no-lockout proof. Models a stake program redeploy (new program id => new
+/// vault_auth PDA): bind under the OLD program, rotate the authority to the admin
+/// wallet, confirm the OLD PDA can no longer flush, then re-bind from the NEW
+/// program and flush again. The final flush is what proves the bind is NOT a
+/// permanent weld.
+#[test]
+fn no_lockout_rotate_then_rebind_from_new_program() {
+    let mut svm = LiteSVM::new().with_spl_programs();
+    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    let stake_id_2 = Pubkey::new_unique(); // the "redeployed" stake program
+    let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    svm.add_program_from_file(stake_id, &stake_so()).unwrap();
+    svm.add_program_from_file(stake_id_2, &stake_so()).unwrap();
+    svm.add_program_from_file(wrapper_id, &wrapper_so())
+        .unwrap();
+
+    let admin = Keypair::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
+
+    let (market, mint, wrapper_vault) =
+        build_live_market(&mut svm, wrapper_id, token_program, &admin, &payer);
+
+    // --- OLD program: bind -> flush works ---
+    let pool_a = add_stake_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        mint,
+        &admin.pubkey(),
+        100_000,
+    );
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        bind_ix(&pool_a, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("bind A");
+    // locate insurance_authority by searching for the unique bound PDA bytes.
+    let off = find_pubkey_offset(
+        &svm.get_account(&market).unwrap().data,
+        &pool_a.vault_auth.to_bytes(),
+    )
+    .expect("insurance_authority == vault_auth_A after bind");
+    assert_eq!(read_at(&svm, &market, off), pool_a.vault_auth.to_bytes());
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        flush_ix_ctx(
+            &pool_a,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            &admin.pubkey(),
+            40_000,
+        ),
+    )
+    .expect("flush A");
+    assert_eq!(token_amount(&svm, &wrapper_vault), 40_000);
+
+    // --- ROTATE the authority off the PDA to the admin wallet ---
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        rotate_ix(
+            &pool_a,
+            wrapper_id,
+            market,
+            &admin.pubkey(),
+            &admin.pubkey(),
+        ),
+    )
+    .expect("rotate insurance_authority -> admin wallet");
+    assert_eq!(
+        read_at(&svm, &market, off),
+        admin.pubkey().to_bytes(),
+        "insurance_authority rotated to the admin wallet"
+    );
+
+    // --- OLD program flush now rejects at the operative authority gate ---
+    let err = send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        flush_ix_ctx(
+            &pool_a,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            &admin.pubkey(),
+            10_000,
+        ),
+    )
+    .expect_err("old-PDA flush must reject after rotate");
+    match err {
+        TransactionError::InstructionError(_, InstructionError::Custom(c)) => {
+            assert_eq!(c, 8, "operative insurance_authority gate (Unauthorized=8)");
+            assert_ne!(c, 21, "must NOT be an incidental EngineLockActive");
+        }
+        other => panic!("expected Custom(8) Unauthorized, got {other:?}"),
+    }
+    assert_eq!(
+        token_amount(&svm, &wrapper_vault),
+        40_000,
+        "rejected flush moved nothing"
+    );
+
+    // --- NEW program: re-bind (admin is current authority now) + flush works ---
+    let pool_b = add_stake_pool(
+        &mut svm,
+        stake_id_2,
+        wrapper_id,
+        market,
+        mint,
+        &admin.pubkey(),
+        100_000,
+    );
+    assert_ne!(
+        pool_b.vault_auth, pool_a.vault_auth,
+        "redeployed program derives a NEW vault_auth PDA"
+    );
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        bind_ix(&pool_b, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("re-bind from the NEW program");
+    assert_eq!(
+        read_at(&svm, &market, off),
+        pool_b.vault_auth.to_bytes(),
+        "insurance_authority re-bound to the NEW PDA"
+    );
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        flush_ix_ctx(
+            &pool_b,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            &admin.pubkey(),
+            25_000,
+        ),
+    )
+    .expect("flush from the NEW program (NO LOCKOUT)");
+    assert_eq!(
+        token_amount(&svm, &wrapper_vault),
+        40_000 + 25_000,
+        "the redeployed program's flush applied — the bind was never a permanent weld"
+    );
+}

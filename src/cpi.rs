@@ -149,6 +149,54 @@ pub fn cpi_bind_insurance_authority<'a>(
     )
 }
 
+// ═══════════════════════════════════════════════════════════════
+// UpdateAuthority (Tag 32) — rotate insurance_authority OFF our PDA
+// ═══════════════════════════════════════════════════════════════
+// Same wrapper instruction as the bind, but the account ROLES invert:
+//   current      = our `vault_auth` PDA (signs via invoke_signed)
+//   new_authority = admin-specified `new_target` (co-signs the outer tx)
+//
+// WHY THIS EXISTS (the no-lockout escape): `cpi_bind_insurance_authority` welds
+// `insurance_authority` to our PDA. Moving it OFF requires the PDA to sign as the
+// CURRENT authority (v16_program.rs:9484) — which only a stake CPI can produce.
+// Without a rotate path, a stake redeploy to a NEW program id (its `vault_auth`
+// PDA derives under the new id) would orphan `insurance_authority` on the dead
+// program and brick the insurance flush unrecoverably. Rotate is the deliberate,
+// admin-gated migration/incident primitive: rotate to the admin wallet from the
+// OLD program before decommissioning it, then re-bind from the NEW program.
+// `new_target` must co-sign the outer tx (the wrapper requires the new authority
+// to sign, 9459); a typical migration uses the admin wallet as the intermediary.
+
+pub fn cpi_rotate_insurance_authority<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>, // CURRENT authority = our PDA; signs via invoke_signed
+    new_target: &AccountInfo<'a>, // NEW authority (admin-specified); co-signs the outer tx
+    market: &AccountInfo<'a>,     // the slab/market account (writable, wrapper-owned)
+    signer_seeds: &[&[u8]],       // vault_auth PDA seeds
+) -> ProgramResult {
+    // tag(1) + kind(1) + new_pubkey(32) = 34 bytes (new_pubkey = new_target.key).
+    let mut data = Vec::with_capacity(34);
+    data.push(TAG_UPDATE_AUTHORITY);
+    data.push(AUTHORITY_INSURANCE);
+    data.extend_from_slice(new_target.key.as_ref());
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true), // current authority (PDA), signer via invoke_signed
+            AccountMeta::new_readonly(*new_target.key, true), // new authority, signer (outer tx)
+            AccountMeta::new(*market.key, false),             // market, writable
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[vault_auth.clone(), new_target.clone(), market.clone()],
+        &[signer_seeds],
+    )
+}
+
 #[cfg(test)]
 mod tag_tests {
     use super::*;

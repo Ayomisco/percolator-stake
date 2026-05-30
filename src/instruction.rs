@@ -91,6 +91,26 @@ pub enum StakeInstruction {
     ///   4. `[]` Percolator program
     BindInsuranceAuthority,
 
+    /// 20: RotateInsuranceAuthority — admin-gated migration/incident primitive
+    /// that moves the market's `insurance_authority` OFF our `vault_auth` PDA to an
+    /// admin-specified `new_target`. CPIs UpdateAuthority(INSURANCE, new_target)
+    /// with the PDA signing as the CURRENT authority (invoke_signed) and new_target
+    /// co-signing the outer tx as the NEW authority. This is the ESCAPE from the
+    /// otherwise-permanent bind: without it, a stake redeploy to a new program id
+    /// would orphan insurance_authority on the dead program and brick the flush.
+    /// Migration: rotate to the admin wallet from the OLD program before
+    /// decommissioning it, then re-bind from the NEW program. Only works while the
+    /// PDA is the current authority (i.e. after a bind).
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
+    ///   1. `[]` Pool PDA
+    ///   2. `[]` Vault authority PDA (the CURRENT authority; signed via CPI)
+    ///   3. `[signer]` New target authority (the successor; co-signs the outer tx)
+    ///   4. `[writable]` Slab / market account (wrapper-owned)
+    ///   5. `[]` Percolator program
+    RotateInsuranceAuthority,
+
     /// 4: Admin updates pool configuration.
     ///
     /// Accounts:
@@ -278,6 +298,7 @@ impl StakeInstruction {
             6 => Ok(Self::AcceptAdmin),
             // Tags 7-9, 11 tombstoned — were admin CPI proxies, now removed.
             19 => Ok(Self::BindInsuranceAuthority),
+            20 => Ok(Self::RotateInsuranceAuthority),
             10 => {
                 if rest.len() < 8 {
                     return Err(ProgramError::InvalidInstructionData);
@@ -465,6 +486,14 @@ mod tests {
         // trailing bytes are ignored (no payload); still decodes.
         match StakeInstruction::unpack(&[19u8, 0, 0]).unwrap() {
             StakeInstruction::BindInsuranceAuthority => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_rotate_insurance_authority() {
+        match StakeInstruction::unpack(&[20u8]).unwrap() {
+            StakeInstruction::RotateInsuranceAuthority => {}
             _ => panic!("wrong variant"),
         }
     }

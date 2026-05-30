@@ -141,6 +141,9 @@ pub fn process(
         StakeInstruction::BindInsuranceAuthority => {
             process_bind_insurance_authority(program_id, accounts)
         }
+        StakeInstruction::RotateInsuranceAuthority => {
+            process_rotate_insurance_authority(program_id, accounts)
+        }
         StakeInstruction::ReturnInsurance { amount } => {
             process_return_insurance(program_id, accounts, amount)
         }
@@ -1312,6 +1315,86 @@ fn process_bind_insurance_authority(
     )?;
 
     msg!("BindInsuranceAuthority: market insurance_authority bound to vault_auth PDA");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 20: RotateInsuranceAuthority — admin-gated escape from the bind
+// ═══════════════════════════════════════════════════════════════
+
+/// Admin-gated rotation of the market's `insurance_authority` OFF our `vault_auth`
+/// PDA to an admin-specified `new_target`. CPIs UpdateAuthority(INSURANCE,
+/// new_target) with the PDA signing as the CURRENT authority (invoke_signed) and
+/// `new_target` co-signing the outer tx as the NEW authority. The escape from the
+/// otherwise-permanent bind (a stake redeploy must rotate to the admin wallet from
+/// the old program before decommissioning, then re-bind from the new program).
+/// Only succeeds while the PDA is the current authority (i.e. after a bind);
+/// otherwise the wrapper rejects with Unauthorized.
+fn process_rotate_insurance_authority(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let vault_auth = next_account_info(accounts_iter)?;
+    let new_target = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    // The wrapper requires the NEW authority to co-sign; surface a clear error
+    // here rather than an opaque CPI failure if it didn't sign.
+    if !new_target.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    let (pool_slab, pool_percolator) = {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if pool.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        if !pool.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        validate_pool_version(pool)?;
+        // Admin-gated: only the pool admin may rotate the insurance authority.
+        if pool.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        (pool.slab, pool.percolator_program)
+    };
+
+    if pool_slab != slab.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if pool_percolator != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
+    // Derive + verify the vault_auth PDA (the CURRENT authority we sign as).
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+    cpi::cpi_rotate_insurance_authority(
+        percolator_program,
+        vault_auth, // current authority (the PDA), signed via invoke_signed
+        new_target, // new authority (admin-specified), co-signs the outer tx
+        slab,       // market
+        vault_auth_seeds,
+    )?;
+
+    msg!("RotateInsuranceAuthority: insurance_authority rotated off vault_auth PDA to new target");
     Ok(())
 }
 
