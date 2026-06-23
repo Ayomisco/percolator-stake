@@ -1375,6 +1375,7 @@ fn process_flush_to_insurance(
     // operate on attacker-controlled bytes.
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?; // N-4: flush mutates pool state
 
     // FINDING-2: Verify token program before the CPI call that grants PDA signer authority.
     // Without this check an attacker can pass a fake token program, receive the PDA
@@ -1559,6 +1560,7 @@ fn process_update_config(
     // without an authentic pool PDA.
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?; // N-4: update_config mutates pool state
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
@@ -1616,6 +1618,7 @@ fn process_propose_admin(
     // other admin path).
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?; // N-4: propose_admin mutates pending_admin
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
@@ -1660,6 +1663,7 @@ fn process_accept_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?; // N-4: accept_admin mutates pool.admin
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
@@ -2312,6 +2316,7 @@ fn process_admin_set_hwm_config(
     // BUG-4: Validate pool account ownership and non-emptiness before reading it.
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?; // N-4: hwm_config mutates pool state
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
@@ -2384,6 +2389,7 @@ fn process_admin_set_tranche_config(
     // BUG-4: Validate pool account ownership and non-emptiness before reading it.
     validate_account_owner(pool_ai, program_id)?;
     validate_account_not_empty(pool_ai)?;
+    validate_account_writable(pool_ai)?; // N-4: tranche_config mutates pool state
 
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
@@ -2812,6 +2818,8 @@ fn process_return_insurance(
     verify_token_program(token_program)?;
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?; // N-4: return_insurance mutates pool.total_returned
+    validate_account_writable(vault)?;    // N-4: vault is the SPL transfer destination
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
