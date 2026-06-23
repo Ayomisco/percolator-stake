@@ -1395,6 +1395,17 @@ fn process_flush_to_insurance(
         return Err(StakeError::InvalidPoolMode.into());
     }
 
+    // N-6: block flush after market resolution. After SetMarketResolved, LP holders
+    // expect to be redeeming capital; flushing post-resolution moves vault tokens to the
+    // wrapper insurance fund and blocks all withdrawals until admin calls
+    // WithdrawInsurance + ReturnInsurance — which can be stalled indefinitely.
+    // process_deposit already gates on market_resolved (line ~610); this makes flush
+    // consistent with that invariant.
+    if pool.market_resolved() {
+        msg!("FlushToInsurance: market is resolved — use ReturnInsurance path instead");
+        return Err(StakeError::MarketResolved.into());
+    }
+
     // Validate wrapper_vault holds the correct collateral mint (defense-in-depth).
     // The percolator CPI also validates this, but an explicit check here gives a clear
     // error and prevents tokens of the wrong type from being routed to the insurance vault.
